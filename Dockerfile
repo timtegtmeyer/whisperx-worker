@@ -28,13 +28,13 @@ COPY models/whisperx-vad-segmentation.bin /root/.cache/torch/whisperx-vad-segmen
 # Copy the rest of the builder files
 COPY builder /builder
 
-# Download Faster Whisper Models
+# Download Faster Whisper Models at runtime on first cold start
 RUN chmod +x /builder/download_models.sh
-RUN --mount=type=secret,id=hf_token /builder/download_models.sh
+#RUN --mount=type=secret,id=hf_token /builder/download_models.sh
 
 # Permanently upgrade Lightning checkpoint to silence startup warning
-RUN python3 -m lightning.pytorch.utilities.upgrade_checkpoint \
-    /usr/local/lib/python3.12/dist-packages/whisperx/assets/pytorch_model.bin || true
+#RUN python3 -m lightning.pytorch.utilities.upgrade_checkpoint \
+    #/usr/local/lib/python3.12/dist-packages/whisperx/assets/pytorch_model.bin || true
 
 # Copy source code
 COPY src .
