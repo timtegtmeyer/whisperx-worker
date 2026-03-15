@@ -49,6 +49,42 @@ compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accur
 device = "cuda"
 whisper_arch = "./models/faster-whisper-large-v3"
 
+# ---------------------------------------------------------------------------
+# Module-level model cache — keeps the whisperx model in VRAM between calls
+# so a persistent pod (FastAPI server) pays the load cost only once.
+# ---------------------------------------------------------------------------
+_whisper_cache: dict = {"model": None, "key": None}
+
+
+def _load_whisper(language, asr_options: dict, vad_options: dict):
+    """Return a cached FasterWhisperPipeline if options match, otherwise reload."""
+    global _whisper_cache
+
+    def _make_key(d: dict):
+        return tuple(sorted(
+            (k, tuple(v) if isinstance(v, list) else v)
+            for k, v in d.items()
+        ))
+
+    key = (language, _make_key(asr_options), _make_key(vad_options))
+
+    if _whisper_cache["model"] is None or _whisper_cache["key"] != key:
+        if _whisper_cache["model"] is not None:
+            del _whisper_cache["model"]
+            torch.cuda.empty_cache()
+        logger.info("Loading whisperx model (arch=%s, lang=%s)…", whisper_arch, language)
+        _whisper_cache["model"] = whisperx.load_model(
+            whisper_arch, device,
+            compute_type=compute_type,
+            language=language,
+            asr_options=asr_options,
+            vad_options=vad_options,
+        )
+        _whisper_cache["key"] = key
+        logger.info("Whisperx model loaded and cached.")
+
+    return _whisper_cache["model"]
+
 
 class Output(BaseModel):
     segments: Any
@@ -87,10 +123,19 @@ class Predictor(BasePredictor):
                 default=None),
             batch_size: int = Input(
                 description="Parallelization of input audio transcription",
-                default=64),
+                default=16),
             temperature: float = Input(
                 description="Temperature to use for sampling",
                 default=0),
+            beam_size: int = Input(
+                description="Beam search width — higher is more accurate but slower",
+                default=8),
+            condition_on_previous_text: bool = Input(
+                description="Feed previous output as prompt for next window; False prevents error cascade on long/mixed-language audio",
+                default=False),
+            no_speech_threshold: float = Input(
+                description="Segments below this log-probability are treated as silence",
+                default=0.75),
             vad_onset: float = Input(
                 description="VAD onset",
                 default=0.500),
@@ -129,7 +174,10 @@ class Predictor(BasePredictor):
         with torch.inference_mode():
             asr_options = {
                 "temperatures": [temperature],
-                "initial_prompt": initial_prompt
+                "initial_prompt": initial_prompt,
+                "beam_size": beam_size,
+                "condition_on_previous_text": condition_on_previous_text,
+                "no_speech_threshold": no_speech_threshold,
             }
 
             vad_options = {
@@ -166,8 +214,7 @@ class Predictor(BasePredictor):
 
             start_time = time.time_ns() / 1e6
 
-            model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, language=language,
-                                        asr_options=asr_options, vad_options=vad_options)
+            model = _load_whisper(language, asr_options, vad_options)
 
             if debug:
                 elapsed_time = time.time_ns() / 1e6 - start_time
@@ -189,10 +236,6 @@ class Predictor(BasePredictor):
             if debug:
                 elapsed_time = time.time_ns() / 1e6 - start_time
                 print(f"Duration to transcribe: {elapsed_time:.2f} ms")
-
-            gc.collect()
-            torch.cuda.empty_cache()
-            del model
 
             if align_output:
                 if detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_TORCH or detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_HF:
@@ -219,8 +262,7 @@ def get_audio_duration(file_path):
 
 def detect_language(full_audio_file_path, segments_starts, language_detection_min_prob,
                     language_detection_max_tries, asr_options, vad_options, iteration=1):
-    model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, asr_options=asr_options,
-                                vad_options=vad_options)
+    model = _load_whisper(None, asr_options, vad_options)
 
     start_ms = segments_starts[iteration - 1]
 
@@ -240,10 +282,6 @@ def detect_language(full_audio_file_path, segments_starts, language_detection_mi
     logger.info(f"Iteration {iteration} - Detected language: {language} ({language_probability:.2f})")
 
     audio_segment_file_path.unlink()
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model
 
     detected_language = {
         "language": language,

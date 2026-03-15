@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.secrets
+Makefile
 src/.env
 **/.env
 

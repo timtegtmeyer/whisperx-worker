@@ -39,4 +39,4 @@ RUN python3 -m lightning.pytorch.utilities.upgrade_checkpoint \
 # Copy source code
 COPY src .
 
-CMD [ "python3", "-u", "/rp_handler.py" ]
+CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
