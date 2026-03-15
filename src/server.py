@@ -43,9 +43,19 @@ logging.basicConfig(
 logger = logging.getLogger("server")
 
 # ---------------------------------------------------------------------------
-# Globals
+# Globals — all tunable via pod environment variables
 # ---------------------------------------------------------------------------
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "").strip()
+
+# Transcription defaults (overridable per-request, but these are the server defaults)
+DEFAULT_BATCH_SIZE              = int(os.environ.get("BATCH_SIZE", "16"))
+DEFAULT_BEAM_SIZE               = int(os.environ.get("BEAM_SIZE", "8"))
+DEFAULT_TEMPERATURE             = float(os.environ.get("TEMPERATURE", "0.0"))
+DEFAULT_VAD_ONSET               = float(os.environ.get("VAD_ONSET", "0.5"))
+DEFAULT_VAD_OFFSET              = float(os.environ.get("VAD_OFFSET", "0.363"))
+DEFAULT_CONDITION_ON_PREV_TEXT  = os.environ.get("CONDITION_ON_PREVIOUS_TEXT", "false").lower() == "true"
+DEFAULT_NO_SPEECH_THRESHOLD     = float(os.environ.get("NO_SPEECH_THRESHOLD", "0.75"))
+
 MODEL: Optional[Predictor] = None
 _GPU_LOCK = threading.Lock()
 
@@ -68,6 +78,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("HF_TOKEN not set — diarization will be unavailable")
 
+    logger.info(
+        "Config — batch_size=%d beam_size=%d temperature=%.1f vad_onset=%.3f vad_offset=%.3f "
+        "condition_on_previous_text=%s no_speech_threshold=%.2f",
+        DEFAULT_BATCH_SIZE, DEFAULT_BEAM_SIZE, DEFAULT_TEMPERATURE,
+        DEFAULT_VAD_ONSET, DEFAULT_VAD_OFFSET,
+        DEFAULT_CONDITION_ON_PREV_TEXT, DEFAULT_NO_SPEECH_THRESHOLD,
+    )
     logger.info("Warming up WhisperX model…")
     MODEL = Predictor()
     MODEL.setup()
@@ -87,19 +104,32 @@ class SpeakerSample(BaseModel):
     url: str
 
 
+def _transcribe_request_defaults() -> dict:
+    """Build Field defaults from env vars at import time."""
+    return dict(
+        batch_size=DEFAULT_BATCH_SIZE,
+        temperature=DEFAULT_TEMPERATURE,
+        beam_size=DEFAULT_BEAM_SIZE,
+        vad_onset=DEFAULT_VAD_ONSET,
+        vad_offset=DEFAULT_VAD_OFFSET,
+        condition_on_previous_text=DEFAULT_CONDITION_ON_PREV_TEXT,
+        no_speech_threshold=DEFAULT_NO_SPEECH_THRESHOLD,
+    )
+
+
 class TranscribeRequest(BaseModel):
     audio_file: str                              # URL or base64-encoded audio
     language: Optional[str] = None              # None = auto-detect
     language_detection_min_prob: float = 0.0
     language_detection_max_tries: int = 5
     initial_prompt: Optional[str] = None
-    batch_size: int = 16
-    temperature: float = 0.0
-    beam_size: int = 8
-    vad_onset: float = 0.5
-    vad_offset: float = 0.363
-    condition_on_previous_text: bool = False
-    no_speech_threshold: float = 0.75
+    batch_size: int = DEFAULT_BATCH_SIZE
+    temperature: float = DEFAULT_TEMPERATURE
+    beam_size: int = DEFAULT_BEAM_SIZE
+    vad_onset: float = DEFAULT_VAD_ONSET
+    vad_offset: float = DEFAULT_VAD_OFFSET
+    condition_on_previous_text: bool = DEFAULT_CONDITION_ON_PREV_TEXT
+    no_speech_threshold: float = DEFAULT_NO_SPEECH_THRESHOLD
     align_output: bool = False
     diarization: bool = False
     min_speakers: Optional[int] = None
