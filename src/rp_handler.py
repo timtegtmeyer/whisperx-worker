@@ -179,7 +179,17 @@ def run(job):
     else:
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
-    # 4-Cleanup and return output_dict normally
+    # 5) Strip intermediate speaker-identification fields from segments to keep
+    #    the response within RunPod's payload size limit (~20 MB).
+    for seg in output_dict.get("segments", []):
+        seg.pop("speaker_id", None)
+        seg.pop("similarity", None)
+        # Word-level timestamps are large and not consumed downstream;
+        # keep only if explicitly requested.
+        if not job_input.get("align_output", False):
+            seg.pop("words", None)
+
+    # 6-Cleanup and return output_dict normally
     try:
         rp_cleanup.clean(["input_objects"])
         cleanup_job_files(job_id)
