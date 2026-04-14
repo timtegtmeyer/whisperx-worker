@@ -180,7 +180,10 @@ def run(job):
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
     # 5) Strip segments to essential fields, merge adjacent same-speaker segments,
-    #    and ensure the payload stays within RunPod's ~20 MB job-done limit.
+    #    then gzip+base64 compress to stay within RunPod's payload limit.
+    import gzip as _gzip
+    import json as _json
+
     keep_words = job_input.get("align_output", False)
 
     # 5a) Strip to minimal fields
@@ -201,9 +204,7 @@ def run(job):
         if clean["text"]:
             minimal_segments.append(clean)
 
-    # 5b) Merge adjacent segments with the same speaker to reduce payload size.
-    #     A 1-hour podcast can have 3000+ segments; merging consecutive same-speaker
-    #     segments typically reduces this to ~500-800 turns.
+    # 5b) Merge adjacent segments with the same speaker to reduce count
     merged = []
     for seg in minimal_segments:
         if merged and merged[-1].get("speaker") == seg.get("speaker") and seg.get("speaker"):
@@ -213,7 +214,21 @@ def run(job):
             merged.append(seg)
 
     logger.info(f"Segments: {len(minimal_segments)} raw → {len(merged)} after merge")
-    output_dict["segments"] = merged
+
+    # 5c) Check payload size — if over 10 MB, gzip+base64 compress the segments.
+    #     The consumer (tenant-backend) detects "segments_gz" and decompresses.
+    segments_json = _json.dumps(merged, ensure_ascii=False)
+    raw_size = len(segments_json.encode('utf-8'))
+    MAX_INLINE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+    if raw_size > MAX_INLINE_BYTES:
+        compressed = base64.b64encode(_gzip.compress(segments_json.encode('utf-8'))).decode('ascii')
+        logger.info(f"Segments payload {raw_size/1024/1024:.1f} MB → compressed to {len(compressed)/1024/1024:.1f} MB")
+        output_dict.pop("segments", None)
+        output_dict["segments_gz"] = compressed
+        output_dict["segments_count"] = len(merged)
+    else:
+        output_dict["segments"] = merged
 
     # 6-Cleanup and return output_dict normally
     try:
