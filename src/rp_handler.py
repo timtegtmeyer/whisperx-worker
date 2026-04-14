@@ -179,15 +179,27 @@ def run(job):
     else:
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
-    # 5) Strip intermediate speaker-identification fields from segments to keep
-    #    the response within RunPod's payload size limit (~20 MB).
+    # 5) Strip segments down to only the fields consumed downstream (start, end,
+    #    text, speaker) to stay well within RunPod's ~20 MB payload limit.
+    #    Word-level timestamps, embeddings, and speaker-ID metadata are large
+    #    and not needed by the tenant-backend transcript builder.
+    keep_words = job_input.get("align_output", False)
+    minimal_segments = []
     for seg in output_dict.get("segments", []):
-        seg.pop("speaker_id", None)
-        seg.pop("similarity", None)
-        # Word-level timestamps are large and not consumed downstream;
-        # keep only if explicitly requested.
-        if not job_input.get("align_output", False):
-            seg.pop("words", None)
+        clean = {
+            "start": seg.get("start"),
+            "end": seg.get("end"),
+            "text": seg.get("text", ""),
+        }
+        if seg.get("speaker"):
+            clean["speaker"] = seg["speaker"]
+        if keep_words and seg.get("words"):
+            clean["words"] = [
+                {"start": w.get("start"), "end": w.get("end"), "word": w.get("word", "")}
+                for w in seg["words"]
+            ]
+        minimal_segments.append(clean)
+    output_dict["segments"] = minimal_segments
 
     # 6-Cleanup and return output_dict normally
     try:
