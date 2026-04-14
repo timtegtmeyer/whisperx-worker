@@ -179,17 +179,17 @@ def run(job):
     else:
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
-    # 5) Strip segments down to only the fields consumed downstream (start, end,
-    #    text, speaker) to stay well within RunPod's ~20 MB payload limit.
-    #    Word-level timestamps, embeddings, and speaker-ID metadata are large
-    #    and not needed by the tenant-backend transcript builder.
+    # 5) Strip segments to essential fields, merge adjacent same-speaker segments,
+    #    and ensure the payload stays within RunPod's ~20 MB job-done limit.
     keep_words = job_input.get("align_output", False)
+
+    # 5a) Strip to minimal fields
     minimal_segments = []
     for seg in output_dict.get("segments", []):
         clean = {
-            "start": seg.get("start"),
-            "end": seg.get("end"),
-            "text": seg.get("text", ""),
+            "start": round(seg.get("start", 0), 3),
+            "end": round(seg.get("end", 0), 3),
+            "text": seg.get("text", "").strip(),
         }
         if seg.get("speaker"):
             clean["speaker"] = seg["speaker"]
@@ -198,8 +198,22 @@ def run(job):
                 {"start": w.get("start"), "end": w.get("end"), "word": w.get("word", "")}
                 for w in seg["words"]
             ]
-        minimal_segments.append(clean)
-    output_dict["segments"] = minimal_segments
+        if clean["text"]:
+            minimal_segments.append(clean)
+
+    # 5b) Merge adjacent segments with the same speaker to reduce payload size.
+    #     A 1-hour podcast can have 3000+ segments; merging consecutive same-speaker
+    #     segments typically reduces this to ~500-800 turns.
+    merged = []
+    for seg in minimal_segments:
+        if merged and merged[-1].get("speaker") == seg.get("speaker") and seg.get("speaker"):
+            merged[-1]["end"] = seg["end"]
+            merged[-1]["text"] += " " + seg["text"]
+        else:
+            merged.append(seg)
+
+    logger.info(f"Segments: {len(minimal_segments)} raw → {len(merged)} after merge")
+    output_dict["segments"] = merged
 
     # 6-Cleanup and return output_dict normally
     try:
