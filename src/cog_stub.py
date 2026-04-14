@@ -5,8 +5,10 @@ from pathlib import Path as _Path
 # Minimal stand-ins for the 4 cog symbols we import
 # ----------------------------------------------------
 class Input:                         # noqa: N801
-    def __init__(self, *_, **__):
-        pass
+    """Stand-in for cog.Input — returns the default value so it works as a
+    function-parameter default: ``beam_size: int = Input(default=8)``."""
+    def __new__(cls, *_args, default=None, **_kwargs):
+        return default
 
 class BasePredictor:                 # noqa: N801
     def setup(self):
