@@ -1,28 +1,30 @@
+GHCR_IMAGE = ghcr.io/timtegtmeyer/whisperx-worker
+BUILDER    = ghcr-builder
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-.PHONY: release
-release: ## Create a versioned release (prompts for version, e.g. 1.0.1)
-	@echo ""; \
-	echo "Current tags:"; \
-	git tag --sort=-v:refname | head -5 || echo "  (none)"; \
+.PHONY: build
+build: ## Build, push to GHCR, capture digest, tag
+	@PREV=$$(git tag --sort=-v:refname | head -1 | sed 's/^v//'); \
+	if [ -z "$$PREV" ]; then PREV="0.0.0"; fi; \
+	NEW=$$(echo $$PREV | awk -F. '{printf "%d.%d.%d", $$1, $$2, $$3+1}'); \
+	echo "Building v$$NEW..."; \
+	docker buildx build --builder $(BUILDER) --platform linux/amd64 --push \
+		--secret id=HF_TOKEN \
+		-t $(GHCR_IMAGE):v$$NEW \
+		-t $(GHCR_IMAGE):latest \
+		. && \
+	DIGEST=$$(docker buildx imagetools inspect $(GHCR_IMAGE):v$$NEW --format '{{.Manifest.Digest}}'); \
+	echo "$(GHCR_IMAGE)@$$DIGEST" > .last-digest; \
 	echo ""; \
-	read -p "Version to release (e.g. 1.0.1): " version; \
-	if [ -z "$$version" ]; then echo "Aborted."; exit 1; fi; \
-	tag="v$$version"; \
+	echo "Digest: $(GHCR_IMAGE)@$$DIGEST"; \
 	echo ""; \
-	echo "This will:"; \
-	echo "  1. Create git tag $$tag"; \
-	echo "  2. Push to origin (triggers Docker image build)"; \
-	echo "  3. Publish ghcr.io/timtegtmeyer/whisperx-worker:$$version"; \
-	echo ""; \
-	read -p "Continue? [y/N] " confirm; \
-	if [ "$$confirm" != "y" ] && [ "$$confirm" != "Y" ]; then echo "Aborted."; exit 1; fi; \
-	git tag "$$tag" && \
-	git push origin "$$tag" && \
-	echo "" && \
-	echo "✓ Tag $$tag pushed. Image will be available at:" && \
-	echo "  ghcr.io/timtegtmeyer/whisperx-worker:$$version"
+	git add -A && git commit -m "build: v$$NEW" && git tag v$$NEW
+
+.PHONY: digest
+digest: ## Show current image digest for RunPod endpoint config
+	@cat .last-digest 2>/dev/null || echo "No digest — run 'make build' first"
