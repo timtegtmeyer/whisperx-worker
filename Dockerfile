@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04@sha256:c40d1065da90274969f9faa7fe1a7fcd1c374d5783482eec09ee5b516746088f
 
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-c"]
