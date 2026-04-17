@@ -1,13 +1,11 @@
-# ---------- PyTorch CUDA 12.4 wheels ----------
---extra-index-url https://download.pytorch.org/whl/cu124
-torch~=2.5.0
-torchaudio~=2.5.0
+# ---------- PyTorch (bundles CUDA runtime internally) ----------
+torch~=2.8.0
+torchaudio~=2.8.0
 
 # ---------- main libs ----------
 whisperx==3.8.1
 pyannote.audio>=4.0.0
-# torchcodec requires Python 3.12+ — skip on 3.10
-# torchcodec>=0.6,<0.8
+torchcodec>=0.6,<0.8
 ctranslate2>=4.5.0
 faster-whisper>=1.1.1
 transformers>=4.48.0
