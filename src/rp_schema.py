@@ -26,7 +26,7 @@ INPUT_VALIDATIONS = {
     'batch_size': {
         'type': int,
         'required': False,
-        'default': 64
+        'default': 16
     },
     'temperature': {
         'type': float,

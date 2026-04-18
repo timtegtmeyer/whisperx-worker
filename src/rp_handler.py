@@ -1,4 +1,5 @@
 import base64
+import gc
 import os
 import sys
 import shutil
@@ -13,6 +14,7 @@ import runpod
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.utils import download_files_from_urls, rp_cleanup
 
+import predict as predict_module
 from rp_schema import INPUT_VALIDATIONS
 from predict import Predictor, Output
 from speaker_profiles import load_embeddings, relabel
@@ -137,7 +139,7 @@ def run(job):
         "language_detection_min_prob": job_input.get("language_detection_min_prob", 0),
         "language_detection_max_tries": job_input.get("language_detection_max_tries", 5),
         "initial_prompt"           : job_input.get("initial_prompt"),
-        "batch_size"               : job_input.get("batch_size", 64),
+        "batch_size"               : job_input.get("batch_size", 16),
         "temperature"              : job_input.get("temperature", 0),
         "vad_onset"                : job_input.get("vad_onset", 0.50),
         "vad_offset"               : job_input.get("vad_offset", 0.363),
@@ -153,6 +155,17 @@ def run(job):
         result = MODEL.predict(**predict_input)             # <-- heavy job
     except Exception as e:
         logger.error("WhisperX prediction failed", exc_info=True)
+        # Evict cached model + flush CUDA allocator so next job on same worker
+        # starts with clean VRAM. Without this, an OOM mid-transcribe leaves
+        # fragmented allocations that fail every subsequent job.
+        cache = getattr(predict_module, "_whisper_cache", None)
+        if cache and cache.get("model") is not None:
+            cache["model"] = None
+            cache["key"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         return {"error": f"prediction: {e}"}
 
     output_dict = {
