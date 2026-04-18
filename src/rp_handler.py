@@ -174,18 +174,23 @@ def run(job):
     }
     # ------------------------------------------------embedding-info----------------
     # 4) speaker verification (optional)
+    # Threshold controls how close the ECAPA cosine similarity must be before
+    # a diarized SPEAKER_XX label is auto-replaced with an enrolled name.
+    # 0.1 (old default) was effectively "always match", 0.85 is the recurring-
+    # host threshold from the pipeline plan. tenant-backend sets it via the
+    # speaker_match_threshold job input; this stays configurable from outside.
+    speaker_match_threshold = float(job_input.get("speaker_match_threshold", 0.85))
     if embeddings:
         try:
             segments_with_speakers = identify_speakers_on_segments(
                 segments=output_dict["segments"],
                 audio_path=audio_file_path,
                 enrolled=embeddings,
-                threshold=0.1  # Adjust threshold as needed
+                threshold=speaker_match_threshold,
             )
-            #output_dict["segments"] = segments_with_speakers
             segments_with_final_labels = relabel_speakers_by_avg_similarity(segments_with_speakers)
             output_dict["segments"] = segments_with_final_labels
-            logger.info("Speaker identification completed successfully.")
+            logger.info("Speaker identification completed successfully (threshold=%s).", speaker_match_threshold)
         except Exception as e:
             logger.error("Speaker identification failed", exc_info=True)
             output_dict["warning"] = f"Speaker identification skipped: {e}"
@@ -199,7 +204,19 @@ def run(job):
 
     keep_words = job_input.get("align_output", False)
 
-    # 5a) Strip to minimal fields
+    # 5a) Strip to minimal fields + preserve avg_logprob (faster-whisper gives
+    # it per segment) as a normalised confidence in [0, 1]. Exp(avg_logprob)
+    # is the model's probability estimate for the transcribed text.
+    def _confidence(seg):
+        lp = seg.get("avg_logprob")
+        if lp is None:
+            return None
+        try:
+            import math as _math
+            return round(_math.exp(lp), 4)
+        except Exception:
+            return None
+
     minimal_segments = []
     for seg in output_dict.get("segments", []):
         clean = {
@@ -209,6 +226,9 @@ def run(job):
         }
         if seg.get("speaker"):
             clean["speaker"] = seg["speaker"]
+        conf = _confidence(seg)
+        if conf is not None:
+            clean["confidence"] = conf
         if keep_words and seg.get("words"):
             clean["words"] = [
                 {"start": w.get("start"), "end": w.get("end"), "word": w.get("word", "")}
@@ -217,12 +237,33 @@ def run(job):
         if clean["text"]:
             minimal_segments.append(clean)
 
-    # 5b) Merge adjacent segments with the same speaker to reduce count
+    # 5b) Merge adjacent segments with the same speaker; take a
+    # duration-weighted average of the per-segment confidences.
+    def _merge_conf(a, b, a_dur, b_dur):
+        ca = a.get("confidence")
+        cb = b.get("confidence")
+        if ca is None and cb is None:
+            return None
+        if ca is None:
+            return cb
+        if cb is None:
+            return ca
+        total = a_dur + b_dur
+        if total <= 0:
+            return (ca + cb) / 2
+        return round((ca * a_dur + cb * b_dur) / total, 4)
+
     merged = []
     for seg in minimal_segments:
         if merged and merged[-1].get("speaker") == seg.get("speaker") and seg.get("speaker"):
-            merged[-1]["end"] = seg["end"]
-            merged[-1]["text"] += " " + seg["text"]
+            prev = merged[-1]
+            prev_dur = prev["end"] - prev["start"]
+            seg_dur = seg["end"] - seg["start"]
+            mc = _merge_conf(prev, seg, prev_dur, seg_dur)
+            prev["end"] = seg["end"]
+            prev["text"] += " " + seg["text"]
+            if mc is not None:
+                prev["confidence"] = mc
         else:
             merged.append(seg)
 
