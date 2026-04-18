@@ -82,5 +82,10 @@ INPUT_VALIDATIONS = {
         'type': list,
         'required': False,
         'default': []
+    },
+    'speaker_match_threshold': {
+        'type': float,
+        'required': False,
+        'default': 0.85
     }
 }
