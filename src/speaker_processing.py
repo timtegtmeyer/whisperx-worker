@@ -428,10 +428,17 @@ def relabel_speakers_by_avg_similarity(segments: list[dict]) -> list[dict]:
         best_match = max(avg, key=avg.get)
         relabel_map[orig_spk] = best_match
 
-    # Step 3: apply relabeling
+    # Step 3: apply relabeling — but preserve original SPEAKER_XX labels for
+    # unmatched speakers. Previously ALL unmatched speakers were renamed to
+    # "Unknown", which collided multiple distinct speakers into a single
+    # bucket and broke downstream LLM-driven speaker name mapping (no way
+    # to tell which SPEAKER_XX was which once both became "Unknown"). Keep
+    # the raw diarization label in that case so the PHP pipeline's
+    # mapSpeakerLabels step can still tell them apart and match them to
+    # names from transcript context.
     for seg in segments:
         spk = seg.get("speaker")
-        if spk in relabel_map:
+        if spk in relabel_map and relabel_map[spk] != "Unknown":
             seg["speaker"] = relabel_map[spk]
 
     return segments
