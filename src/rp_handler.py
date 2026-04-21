@@ -133,6 +133,14 @@ def run(job):
             embeddings = {}  # graceful degradation: proceed without profiles
 
     # ------------- 3) call WhisperX / VAD / diarization -------------
+    # `diarization_turns`: when provided (chunked-whisper flow), the worker
+    # skips its internal pyannote call and uses these turns directly. Saves
+    # VRAM + time and lets every chunk share episode-stable speaker IDs.
+    # `audio_offset_sec`: when > 0, every timestamp in the output is rebased
+    # into the episode's absolute time frame before return.
+    diarization_turns = job_input.get("diarization_turns") or None
+    audio_offset_sec = float(job_input.get("audio_offset_sec", 0.0) or 0.0)
+
     predict_input = {
         "audio_file"               : audio_file_path,
         "language"                 : job_input.get("language"),
@@ -149,6 +157,7 @@ def run(job):
         "min_speakers"             : job_input.get("min_speakers"),
         "max_speakers"             : job_input.get("max_speakers"),
         "debug"                    : job_input.get("debug", False),
+        "diarization_turns"        : diarization_turns,
     }
 
     try:
@@ -230,8 +239,17 @@ def run(job):
         if conf is not None:
             clean["confidence"] = conf
         if keep_words and seg.get("words"):
+            # Pass through per-word score when whisperx emits it. Used by
+            # the downstream transcript-correction stage to identify
+            # low-confidence proper-noun spans; falls back gracefully on
+            # segment-level confidence when missing.
             clean["words"] = [
-                {"start": w.get("start"), "end": w.get("end"), "word": w.get("word", "")}
+                {
+                    "start": w.get("start"),
+                    "end": w.get("end"),
+                    "word": w.get("word", ""),
+                    "score": w.get("score", w.get("probability")),
+                }
                 for w in seg["words"]
             ]
         if clean["text"]:
@@ -266,6 +284,22 @@ def run(job):
                 prev["confidence"] = mc
         else:
             merged.append(seg)
+
+    # 5b.5) Rebase timestamps into the episode's absolute time frame when
+    # this job was a chunk of a larger audio file. The caller passes the
+    # chunk's offset via `audio_offset_sec`; we add it to every segment's
+    # and word's start/end so the caller can stitch N chunk outputs with
+    # monotonic timestamps without any post-processing on its side.
+    if audio_offset_sec > 0:
+        for seg in merged:
+            seg["start"] = round(seg.get("start", 0) + audio_offset_sec, 3)
+            seg["end"] = round(seg.get("end", 0) + audio_offset_sec, 3)
+            for w in seg.get("words", []) or []:
+                if w.get("start") is not None:
+                    w["start"] = round(float(w["start"]) + audio_offset_sec, 3)
+                if w.get("end") is not None:
+                    w["end"] = round(float(w["end"]) + audio_offset_sec, 3)
+        logger.info(f"Rebased {len(merged)} segments by +{audio_offset_sec:.2f}s")
 
     logger.info(f"Segments: {len(minimal_segments)} raw → {len(merged)} after merge")
 
