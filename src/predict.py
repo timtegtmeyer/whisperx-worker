@@ -13,6 +13,12 @@ import math
 import os
 import shutil
 import whisperx
+# whisperx 3.8.1 stopped auto-importing its .alignment submodule at package
+# init, so `whisperx.alignment.DEFAULT_ALIGN_MODELS_*` raises AttributeError
+# unless the submodule is explicitly imported first. Force-import here so
+# the `if detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_*`
+# check below keeps working.
+import whisperx.alignment  # noqa: F401 — imported for side-effect
 import tempfile
 import time
 import torch
