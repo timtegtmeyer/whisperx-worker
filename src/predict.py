@@ -13,6 +13,12 @@ import math
 import os
 import shutil
 import whisperx
+# whisperx 3.8.1 stopped auto-importing its .alignment submodule at package
+# init, so `whisperx.alignment.DEFAULT_ALIGN_MODELS_*` raises AttributeError
+# unless the submodule is explicitly imported first. Force-import here so
+# the `if detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_*`
+# check below keeps working.
+import whisperx.alignment  # noqa: F401 — imported for side-effect
 import tempfile
 import time
 import torch
@@ -169,6 +175,14 @@ class Predictor(BasePredictor):
                             "optional 'name' and 'file_path'. If 'name' is not provided, the file name (without "
                             "extension) is used. If 'file_path' is provided, it will be used directly.",
                 default=[]
+            ),
+            diarization_turns: list = Input(
+                description="Pre-computed pyannote diarization turns "
+                            "[{start, end, speaker}, ...]. When provided, the worker SKIPS its internal "
+                            "DiarizationPipeline call and uses these turns directly to assign word speakers. "
+                            "Used by the chunked-transcription flow so every chunk shares episode-stable "
+                            "speaker IDs assigned by a single pyannote pass over the full audio.",
+                default=None
             )
     ) -> Output:
         with torch.inference_mode():
@@ -243,7 +257,20 @@ class Predictor(BasePredictor):
                 else:
                     logger.warning(f"Cannot align output as language {detected_language} is not supported for alignment")
 
-            if diarization:
+            # Speaker assignment has two mutually-exclusive modes.
+            #
+            # 1) `diarization_turns` provided (chunked-whisper flow):
+            #    pyannote already ran ONCE over the full episode and we
+            #    received its turns for this chunk. Skip the in-worker
+            #    DiarizationPipeline load + inference entirely (saves
+            #    ~1.5 GB VRAM and 20-40 s) and call assign_word_speakers
+            #    directly with a synthesised pandas frame.
+            #
+            # 2) `diarization=True` (legacy single-job flow):
+            #    Run pyannote inside the worker as before.
+            if diarization_turns:
+                result = assign_speakers_from_turns(result, diarization_turns, debug)
+            elif diarization:
                 result = diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
 
             if debug:
@@ -349,6 +376,51 @@ def align(audio, result, debug):
     gc.collect()
     torch.cuda.empty_cache()
     del model_a
+
+    return result
+
+
+def assign_speakers_from_turns(result, turns, debug):
+    """Use pre-computed pyannote turns to label whisperx segments/words.
+
+    Builds the same pandas DataFrame shape whisperx.assign_word_speakers
+    expects (the return type of DiarizationPipeline.__call__), then calls
+    assign_word_speakers so the downstream output matches the legacy
+    diarize() path byte-for-byte except for the source of the speakers.
+
+    Saves ~1.5 GB VRAM and ~20-40 s per chunk because we don't load or
+    run pyannote at all on this worker — the turns came in over the wire
+    from a centrally-run pyannote pass over the full episode.
+    """
+    start_time = time.time_ns() / 1e6
+
+    import pandas as pd
+    # Accept both dict-form and any object with start/end/speaker keys.
+    rows = []
+    for t in turns or []:
+        try:
+            rows.append({
+                "start": float(t["start"]),
+                "end": float(t["end"]),
+                "speaker": str(t["speaker"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not rows:
+        logger.warning("assign_speakers_from_turns: received empty/malformed turns; leaving segments un-labelled")
+        return result
+
+    df = pd.DataFrame(rows)
+    # whisperx.assign_word_speakers signature: (diarize_df, transcript_result)
+    result = whisperx.assign_word_speakers(df, result)
+
+    if debug:
+        elapsed_time = time.time_ns() / 1e6 - start_time
+        print(f"Duration to assign speakers from turns: {elapsed_time:.2f} ms")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return result
 
