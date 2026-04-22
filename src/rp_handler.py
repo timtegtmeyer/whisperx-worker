@@ -197,9 +197,32 @@ def run(job):
                 enrolled=embeddings,
                 threshold=speaker_match_threshold,
             )
-            segments_with_final_labels = relabel_speakers_by_avg_similarity(segments_with_speakers)
-            output_dict["segments"] = segments_with_final_labels
-            logger.info("Speaker identification completed successfully (threshold=%s).", speaker_match_threshold)
+            # Profile-anchored per-segment re-attribution.
+            # The previous code collapsed the per-segment matches back onto the
+            # pyannote cluster label via `relabel_speakers_by_avg_similarity`.
+            # That failed hard on remote/phone recordings where pyannote merges
+            # short alternating turns from two similar voices into one cluster —
+            # then a whole opening block like "Schönen guten Morgen, Richard. /
+            # Guten Morgen, Markus." was attributed to Markus because his name
+            # averaged higher across the cluster.
+            # Instead: trust the per-segment match when the ECAPA cosine clears
+            # `speaker_match_threshold`; keep the raw SPEAKER_XX label only on
+            # low-confidence segments so the PHP side can still merge them into
+            # a cluster for the LLM name-mapping pass.
+            flipped = 0
+            for seg in segments_with_speakers:
+                sid = seg.get("speaker_id")
+                sim = seg.get("similarity", 0.0) or 0.0
+                if sid and sid != "Unknown" and sim >= speaker_match_threshold:
+                    if sid != seg.get("speaker"):
+                        flipped += 1
+                    seg["speaker"] = sid
+                # else: keep the raw pyannote SPEAKER_XX for this segment
+            output_dict["segments"] = segments_with_speakers
+            logger.info(
+                "Speaker identification completed successfully (threshold=%s, reassigned=%d).",
+                speaker_match_threshold, flipped,
+            )
         except Exception as e:
             logger.error("Speaker identification failed", exc_info=True)
             output_dict["warning"] = f"Speaker identification skipped: {e}"
