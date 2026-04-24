@@ -2,7 +2,26 @@
 
 # WhisperX Worker for Runpod
 
-A serverless worker that provides high-quality speech transcription with timestamp alignment and speaker diarization using WhisperX on the Runpod platform.
+A serverless worker that provides high-quality speech transcription with timestamp alignment and custom overlap-weighted speaker attribution on the Runpod platform.
+
+## v2 — Attribution changes
+
+- **Pyannote no longer runs inside this worker.** Diarization is done by
+  the separate pyannote-worker endpoint; its turns are passed in via
+  `diarization_turns`. An empty `diarization_turns` leaves the
+  transcript un-attributed (emits a warning) — the in-worker pyannote
+  fallback was removed so two independent diarization runs can never
+  disagree on speaker count.
+- **Speaker attribution is overlap-weighted, not midpoint-based.** For
+  every word, the worker picks the speaker whose turns overlap the word
+  the most. Words that straddle a turn boundary by ≥ 0.3 s on both
+  sides are emitted for both speakers so no text is lost across the
+  boundary.
+- **Segments are re-grouped by speaker turn.** Whisper's internal
+  segment boundaries are discarded in favour of speaker-contiguous
+  runs, so one segment never mixes two speakers. Adjacent same-speaker
+  segments are NOT merged — downstream pipeline stages handle display
+  grouping.
 
 ## Prerequisites
 

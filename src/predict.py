@@ -257,21 +257,19 @@ class Predictor(BasePredictor):
                 else:
                     logger.warning(f"Cannot align output as language {detected_language} is not supported for alignment")
 
-            # Speaker assignment has two mutually-exclusive modes.
-            #
-            # 1) `diarization_turns` provided (chunked-whisper flow):
-            #    pyannote already ran ONCE over the full episode and we
-            #    received its turns for this chunk. Skip the in-worker
-            #    DiarizationPipeline load + inference entirely (saves
-            #    ~1.5 GB VRAM and 20-40 s) and call assign_word_speakers
-            #    directly with a synthesised pandas frame.
-            #
-            # 2) `diarization=True` (legacy single-job flow):
-            #    Run pyannote inside the worker as before.
+            # Speaker attribution is always driven by the Diarization
+            # worker's pre-computed turns. The in-worker pyannote path
+            # was removed — keeping two diarization sources produced
+            # episode-unstable labels when the two models disagreed on
+            # speaker count, and doubled VRAM for no accuracy gain.
             if diarization_turns:
                 result = assign_speakers_from_turns(result, diarization_turns, debug)
             elif diarization:
-                result = diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
+                logger.warning(
+                    "diarization=True but diarization_turns is empty; "
+                    "skipping attribution. Caller must supply turns from "
+                    "the Diarization worker."
+                )
 
             if debug:
                 print(f"max gpu memory allocated over runtime: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB")
@@ -380,39 +378,147 @@ def align(audio, result, debug):
     return result
 
 
-def assign_speakers_from_turns(result, turns, debug):
-    """Use pre-computed pyannote turns to label whisperx segments/words.
+def assign_speakers_from_turns(result, turns, debug, boundary_split_min_sec=0.3):
+    """Custom overlap-weighted speaker attribution.
 
-    Builds the same pandas DataFrame shape whisperx.assign_word_speakers
-    expects (the return type of DiarizationPipeline.__call__), then calls
-    assign_word_speakers so the downstream output matches the legacy
-    diarize() path byte-for-byte except for the source of the speakers.
+    WhisperX's `assign_word_speakers` picks the speaker whose turn
+    contains the *midpoint* of each word, which fails at turn boundaries
+    (quick "mhm" overlapping the other speaker's sentence) and it shares
+    the label across every word of a whisper segment even when the
+    segment straddles a speaker change. Our custom pass instead:
 
-    Saves ~1.5 GB VRAM and ~20-40 s per chunk because we don't load or
-    run pyannote at all on this worker — the turns came in over the wire
-    from a centrally-run pyannote pass over the full episode.
+      1. For each word, compute overlap duration with every turn speaker
+         and assign the speaker with max overlap.
+      2. If a word spans a turn boundary and each side gets
+         ≥ `boundary_split_min_sec` of overlap, duplicate the word into
+         two half-words so both speakers keep the text — callers can
+         drop duplicates later, but we won't lose text across a
+         boundary.
+      3. Fall back to nearest turn by center-distance if the word has
+         no overlap at all (shouldn't happen unless the word falls in
+         a VAD-silence hole).
+      4. Re-group words into speaker-contiguous segments so the output
+         has one segment per speaker turn inside the transcript, never
+         a mixed-speaker segment.
+
+    Input turns: [{"start", "end", "speaker"}, ...]
     """
     start_time = time.time_ns() / 1e6
 
-    import pandas as pd
-    # Accept both dict-form and any object with start/end/speaker keys.
-    rows = []
+    norm_turns: list[tuple[float, float, str]] = []
     for t in turns or []:
         try:
-            rows.append({
-                "start": float(t["start"]),
-                "end": float(t["end"]),
-                "speaker": str(t["speaker"]),
-            })
+            s = float(t["start"])
+            e = float(t["end"])
+            spk = str(t["speaker"])
         except (KeyError, TypeError, ValueError):
             continue
-    if not rows:
-        logger.warning("assign_speakers_from_turns: received empty/malformed turns; leaving segments un-labelled")
+        if e > s and spk:
+            norm_turns.append((s, e, spk))
+    if not norm_turns:
+        logger.warning("assign_speakers_from_turns: empty/malformed turns; leaving segments unlabelled")
         return result
 
-    df = pd.DataFrame(rows)
-    # whisperx.assign_word_speakers signature: (diarize_df, transcript_result)
-    result = whisperx.assign_word_speakers(df, result)
+    norm_turns.sort(key=lambda t: t[0])
+
+    def _word_speaker(ws: float, we: float) -> list[tuple[str, float]]:
+        """Return up to two (speaker, overlap_sec) pairs sorted by
+        overlap desc. One entry for the clear-winner case, two for a
+        boundary-straddling word that deserves to be split."""
+        if we <= ws:
+            return []
+        overlaps: dict[str, float] = {}
+        for s, e, spk in norm_turns:
+            if e <= ws:
+                continue
+            if s >= we:
+                break
+            ov = max(0.0, min(we, e) - max(ws, s))
+            if ov > 0:
+                overlaps[spk] = overlaps.get(spk, 0.0) + ov
+        if not overlaps:
+            # Nearest turn by center distance
+            wc = (ws + we) / 2
+            best_spk = None
+            best_d = float("inf")
+            for s, e, spk in norm_turns:
+                d = min(abs(wc - s), abs(wc - e))
+                if d < best_d:
+                    best_d = d
+                    best_spk = spk
+            return [(best_spk, 0.0)] if best_spk else []
+        sorted_items = sorted(overlaps.items(), key=lambda x: x[1], reverse=True)
+        if len(sorted_items) >= 2 and sorted_items[1][1] >= boundary_split_min_sec:
+            return sorted_items[:2]
+        return sorted_items[:1]
+
+    new_segments: list[dict] = []
+    current: dict | None = None
+
+    def _flush():
+        nonlocal current
+        if current is not None and current["words"]:
+            current["start"] = current["words"][0].get("start", current.get("start"))
+            current["end"] = current["words"][-1].get("end", current.get("end"))
+            current["text"] = "".join(w.get("word", "") for w in current["words"]).strip()
+            new_segments.append(current)
+        current = None
+
+    def _append_word(spk: str, word: dict):
+        nonlocal current
+        if current is None or current["speaker"] != spk:
+            _flush()
+            current = {"speaker": spk, "words": [], "start": word.get("start"), "end": word.get("end")}
+        current["words"].append(word)
+
+    for seg in result.get("segments", []):
+        seg_words = seg.get("words") or []
+        if not seg_words:
+            # No word-level timestamps (short or unaligned segments).
+            # Attribute the whole segment by its own midpoint.
+            sstart = seg.get("start")
+            send = seg.get("end")
+            if sstart is None or send is None:
+                continue
+            spk_pairs = _word_speaker(float(sstart), float(send))
+            if not spk_pairs:
+                continue
+            spk = spk_pairs[0][0]
+            fake_word = {
+                "word": seg.get("text", ""),
+                "start": sstart,
+                "end": send,
+            }
+            _append_word(spk, fake_word)
+            continue
+
+        for w in seg_words:
+            ws = w.get("start")
+            we = w.get("end")
+            if ws is None or we is None:
+                # Word without timestamps (whisperx emits these for
+                # punctuation sometimes). Glue it onto the current
+                # speaker's run — it has no independent boundary
+                # information anyway.
+                if current is not None:
+                    current["words"].append(w)
+                continue
+            pairs = _word_speaker(float(ws), float(we))
+            if not pairs:
+                continue
+            if len(pairs) == 1:
+                _append_word(pairs[0][0], dict(w))
+                continue
+            # Split across the boundary: duplicate the word into both
+            # speakers' runs. Splitting the glyph itself is unsafe for
+            # non-ASCII text, so each half keeps the full word and
+            # callers know to dedup with a downstream pass.
+            for spk, _ in pairs:
+                _append_word(spk, dict(w))
+
+    _flush()
+
+    result["segments"] = new_segments
 
     if debug:
         elapsed_time = time.time_ns() / 1e6 - start_time
@@ -421,30 +527,6 @@ def assign_speakers_from_turns(result, turns, debug):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    return result
-
-
-def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
-    start_time = time.time_ns() / 1e6
-
-    from whisperx.diarize import DiarizationPipeline
-    diarize_model = DiarizationPipeline(
-        model_name='pyannote/speaker-diarization-community-1',
-        token=huggingface_access_token,
-        device=device,
-    )
-    diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
-
-    result = whisperx.assign_word_speakers(diarize_segments, result)
-
-    if debug:
-        elapsed_time = time.time_ns() / 1e6 - start_time
-        print(f"Duration to diarize segments: {elapsed_time:.2f} ms")
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del diarize_model
 
     return result
 

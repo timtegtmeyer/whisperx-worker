@@ -239,43 +239,60 @@ def run(job):
     else:
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
-    # 5) Strip segments to essential fields, merge adjacent same-speaker segments,
-    #    then gzip+base64 compress to stay within RunPod's payload limit.
+    # 5) Strip segments to essential fields, then gzip+base64 compress
+    #    to stay within RunPod's payload limit. Segments arrive already
+    #    grouped by speaker turn — assign_speakers_from_turns does the
+    #    re-segmentation — so we do NOT merge adjacent same-speaker
+    #    segments here. The old merge produced the "Richard, wo erreiche
+    #    ich dich?" regression by concatenating a mis-labelled utterance
+    #    into the preceding speaker's block and making the error
+    #    unrecoverable downstream.
     import gzip as _gzip
     import json as _json
 
     keep_words = job_input.get("align_output", False)
 
-    # 5a) Strip to minimal fields + preserve avg_logprob (faster-whisper gives
-    # it per segment) as a normalised confidence in [0, 1]. Exp(avg_logprob)
-    # is the model's probability estimate for the transcribed text.
-    def _confidence(seg):
-        lp = seg.get("avg_logprob")
-        if lp is None:
+    def _confidence_from_words(words):
+        """Duration-weighted mean of per-word wav2vec2 alignment scores.
+        These are already in [0, 1] and track attribution quality better
+        than faster-whisper's avg_logprob does for speaker-grouped
+        segments (which have no single avg_logprob anyway)."""
+        if not words:
             return None
-        try:
-            import math as _math
-            return round(_math.exp(lp), 4)
-        except Exception:
+        total_dur = 0.0
+        weighted = 0.0
+        for w in words:
+            score = w.get("score", w.get("probability"))
+            if score is None:
+                continue
+            try:
+                ws = float(w.get("start"))
+                we = float(w.get("end"))
+            except (TypeError, ValueError):
+                continue
+            dur = max(0.0, we - ws)
+            if dur <= 0:
+                continue
+            weighted += float(score) * dur
+            total_dur += dur
+        if total_dur <= 0:
             return None
+        return round(weighted / total_dur, 4)
 
-    minimal_segments = []
+    merged = []
     for seg in output_dict.get("segments", []):
+        words = seg.get("words") or []
         clean = {
-            "start": round(seg.get("start", 0), 3),
-            "end": round(seg.get("end", 0), 3),
+            "start": round(float(seg.get("start", 0) or 0), 3),
+            "end": round(float(seg.get("end", 0) or 0), 3),
             "text": seg.get("text", "").strip(),
         }
         if seg.get("speaker"):
             clean["speaker"] = seg["speaker"]
-        conf = _confidence(seg)
+        conf = _confidence_from_words(words)
         if conf is not None:
             clean["confidence"] = conf
-        if keep_words and seg.get("words"):
-            # Pass through per-word score when whisperx emits it. Used by
-            # the downstream transcript-correction stage to identify
-            # low-confidence proper-noun spans; falls back gracefully on
-            # segment-level confidence when missing.
+        if keep_words and words:
             clean["words"] = [
                 {
                     "start": w.get("start"),
@@ -283,40 +300,10 @@ def run(job):
                     "word": w.get("word", ""),
                     "score": w.get("score", w.get("probability")),
                 }
-                for w in seg["words"]
+                for w in words
             ]
         if clean["text"]:
-            minimal_segments.append(clean)
-
-    # 5b) Merge adjacent segments with the same speaker; take a
-    # duration-weighted average of the per-segment confidences.
-    def _merge_conf(a, b, a_dur, b_dur):
-        ca = a.get("confidence")
-        cb = b.get("confidence")
-        if ca is None and cb is None:
-            return None
-        if ca is None:
-            return cb
-        if cb is None:
-            return ca
-        total = a_dur + b_dur
-        if total <= 0:
-            return (ca + cb) / 2
-        return round((ca * a_dur + cb * b_dur) / total, 4)
-
-    merged = []
-    for seg in minimal_segments:
-        if merged and merged[-1].get("speaker") == seg.get("speaker") and seg.get("speaker"):
-            prev = merged[-1]
-            prev_dur = prev["end"] - prev["start"]
-            seg_dur = seg["end"] - seg["start"]
-            mc = _merge_conf(prev, seg, prev_dur, seg_dur)
-            prev["end"] = seg["end"]
-            prev["text"] += " " + seg["text"]
-            if mc is not None:
-                prev["confidence"] = mc
-        else:
-            merged.append(seg)
+            merged.append(clean)
 
     # 5b.5) Rebase timestamps into the episode's absolute time frame when
     # this job was a chunk of a larger audio file. The caller passes the
@@ -334,7 +321,7 @@ def run(job):
                     w["end"] = round(float(w["end"]) + audio_offset_sec, 3)
         logger.info(f"Rebased {len(merged)} segments by +{audio_offset_sec:.2f}s")
 
-    logger.info(f"Segments: {len(minimal_segments)} raw → {len(merged)} after merge")
+    logger.info(f"Segments emitted: {len(merged)} speaker turns")
 
     # 5c) Check payload size — if over 10 MB, gzip+base64 compress the segments.
     #     The consumer (tenant-backend) detects "segments_gz" and decompresses.
