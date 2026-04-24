@@ -9,6 +9,16 @@ import tempfile
 from dotenv import load_dotenv, find_dotenv
 from huggingface_hub import login, whoami
 import torch
+
+
+def _gpu_name():
+    """GPU display name for saas-side rate-accurate cost calc."""
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return None
 import numpy as np
 import runpod
 from runpod.serverless.utils.rp_validator import validate
@@ -348,6 +358,7 @@ def run(job):
     except Exception as e:
         logger.warning(f"Cleanup issue: {e}", exc_info=True)
 
+    output_dict["gpu_name"] = _gpu_name()
     return output_dict
 
 runpod.serverless.start({"handler": run})
