@@ -48,30 +48,10 @@ INPUT_VALIDATIONS = {
         'required': False,
         'default': False
     },
-    'huggingface_access_token': {
-        'type': str,
-        'required': False,
-        'default': None
-    },
     'debug': {
         'type': bool,
         'required': False,
         'default': False
-    },
-    'speaker_verification': {
-        'type': bool,
-        'required': False,
-        'default': False
-    },
-    'speaker_samples': {
-        'type': list,
-        'required': False,
-        'default': []
-    },
-    'speaker_match_threshold': {
-        'type': float,
-        'required': False,
-        'default': 0.85
     },
     # Chunked-transcription mode: this audio file is a slice of a larger
     # episode starting at this offset (seconds). Every start/end in the

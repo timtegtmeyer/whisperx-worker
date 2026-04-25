@@ -149,21 +149,9 @@ class Predictor(BasePredictor):
             align_output: bool = Input(
                 description="Aligns whisper output to get accurate word-level timestamps",
                 default=False),
-            huggingface_access_token: str = Input(
-                description="HuggingFace token (read). Kept for forward compat with image inputs.",
-                default=None),
             debug: bool = Input(
                 description="Print out compute/inference times and memory usage information",
-                default=False),
-            speaker_verification: bool = Input(
-                description="Enable speaker verification",
-                default=False),
-            speaker_samples: list = Input(
-                description="List of speaker samples for verification. Each sample should be a dict with 'url' and "
-                            "optional 'name' and 'file_path'. If 'name' is not provided, the file name (without "
-                            "extension) is used. If 'file_path' is provided, it will be used directly.",
-                default=[]
-            )
+                default=False)
     ) -> Output:
         with torch.inference_mode():
             asr_options = {

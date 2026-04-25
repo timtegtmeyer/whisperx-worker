@@ -6,9 +6,14 @@ import shutil
 import logging
 import tempfile
 
-from dotenv import load_dotenv, find_dotenv
-from huggingface_hub import login, whoami
 import torch
+import runpod
+from runpod.serverless.utils.rp_validator import validate
+from runpod.serverless.utils import download_files_from_urls, rp_cleanup
+
+import predict as predict_module
+from rp_schema import INPUT_VALIDATIONS
+from predict import Predictor, Output
 
 
 def _gpu_name():
@@ -19,14 +24,7 @@ def _gpu_name():
     except Exception:
         pass
     return None
-import numpy as np
-import runpod
-from runpod.serverless.utils.rp_validator import validate
-from runpod.serverless.utils import download_files_from_urls, rp_cleanup
 
-import predict as predict_module
-from rp_schema import INPUT_VALIDATIONS
-from predict import Predictor, Output
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -51,29 +49,8 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-# ---------------------------------------------------------------------------
-# Hugging Face authentication
-# ---------------------------------------------------------------------------
-load_dotenv(find_dotenv())
-raw_token = os.environ.get("HF_TOKEN", "")
-hf_token = raw_token.strip()
-
-if hf_token and not hf_token.startswith("hf_"):
-    logger.warning("HF_TOKEN does not start with 'hf_' prefix - token may be malformed")
-
-if hf_token:
-    try:
-        logger.debug(f"HF_TOKEN Loaded: {repr(hf_token[:10])}...")
-        login(token=hf_token, add_to_git_credential=False)
-        user = whoami(token=hf_token)
-        logger.info(f"Hugging Face Authenticated as: {user['name']}")
-    except Exception as e:
-        logger.error("Failed to authenticate with Hugging Face", exc_info=True)
-else:
-    logger.warning("No Hugging Face token found in HF_TOKEN environment variable.")
-
-
-
+# ASR-only worker: no HuggingFace authentication, no diarization models.
+# Speaker attribution + diarization happen elsewhere in the pipeline.
 
 MODEL = Predictor()
 MODEL.setup()
@@ -145,7 +122,6 @@ def run(job):
         "vad_onset"                : job_input.get("vad_onset", 0.50),
         "vad_offset"               : job_input.get("vad_offset", 0.363),
         "align_output"             : job_input.get("align_output", True),
-        "huggingface_access_token" : job_input.get("huggingface_access_token") or hf_token,
         "debug"                    : job_input.get("debug", False),
     }
 
