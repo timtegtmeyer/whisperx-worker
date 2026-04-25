@@ -45,36 +45,8 @@ echo "Faster Whisper model downloaded."
 # VAD and wav2vec2 are Docker-handled
 # ===================================
 
-# ===================================
-# Python block: Hugging Face downloads using secret
-# ===================================
-python3 -c "
-import os
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    print('WARNING: python-dotenv not installed, skipping .env loading')
-
-from huggingface_hub import snapshot_download
-
-# Try to read HF token from BuildKit secret file.
-hf_token = None
-try:
-    with open('/run/secrets/hf_token', 'r') as f:
-        hf_token = f.read().strip()
-except Exception as e:
-    print('No secret file found, falling back to environment variable:', e)
-    hf_token = os.environ.get('HF_TOKEN')
-
-# Download SpeechBrain speaker recognition model
-snapshot_download(repo_id='speechbrain/spkrec-ecapa-voxceleb')
-
-# Optionally download PyAnnote models if HF_TOKEN is set
-if hf_token:
-    snapshot_download(repo_id='pyannote/embedding', token=hf_token)
-    snapshot_download(repo_id='pyannote/speaker-diarization-community-1', token=hf_token)
-else:
-    print('WARNING: HF_TOKEN not set, skipping pyannote models download')
-"
+# Speaker / diarization models (ECAPA, pyannote/embedding,
+# pyannote/speaker-diarization-community-1) were removed when ASR was
+# decoupled from diarization. The Diarization runs in its own RunPod
+# worker; this image is ASR-only.
 echo "All models downloaded successfully."
