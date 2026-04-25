@@ -27,11 +27,6 @@ from runpod.serverless.utils import download_files_from_urls, rp_cleanup
 import predict as predict_module
 from rp_schema import INPUT_VALIDATIONS
 from predict import Predictor, Output
-from speaker_profiles import load_embeddings, relabel
-from speaker_processing import (
-    process_diarized_output, enroll_profiles, identify_speakers_on_segments,
-    load_known_speakers_from_samples, identify_speaker, relabel_speakers_by_avg_similarity,
-)
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -128,27 +123,15 @@ def run(job):
         logger.error("Audio input failed", exc_info=True)
         return {"error": f"audio input: {e}"}
 
-    # ------------- 2) download speaker profiles (optional) ----------
-    speaker_profiles = job_input.get("speaker_samples", [])
-    embeddings = {}
-    if speaker_profiles:
-        try:
-            embeddings = load_known_speakers_from_samples(
-                speaker_profiles,
-                huggingface_access_token=hf_token  # or job_input.get("huggingface_access_token")
-            )
-            logger.info(f"Enrolled {len(embeddings)} speaker profiles successfully.")
-        except Exception as e:
-            logger.error("Enrollment failed", exc_info=True)
-            embeddings = {}  # graceful degradation: proceed without profiles
+    # Speaker enrollment / verification removed: worker is ASR-only.
+    # Caller performs speaker attribution post-ASR via the diarization
+    # service output and SpeakerAttributionService.
 
-    # ------------- 3) call WhisperX / VAD / diarization -------------
-    # `diarization_turns`: when provided (chunked-whisper flow), the worker
-    # skips its internal pyannote call and uses these turns directly. Saves
-    # VRAM + time and lets every chunk share episode-stable speaker IDs.
+    # ------------- 3) call WhisperX (ASR + alignment only) ----------
+    # Worker is fully decoupled from diarization. Speaker attribution
+    # happens caller-side via SpeakerAttributionService.
     # `audio_offset_sec`: when > 0, every timestamp in the output is rebased
     # into the episode's absolute time frame before return.
-    diarization_turns = job_input.get("diarization_turns") or None
     audio_offset_sec = float(job_input.get("audio_offset_sec", 0.0) or 0.0)
 
     predict_input = {
@@ -161,13 +144,9 @@ def run(job):
         "temperature"              : job_input.get("temperature", 0),
         "vad_onset"                : job_input.get("vad_onset", 0.50),
         "vad_offset"               : job_input.get("vad_offset", 0.363),
-        "align_output"             : job_input.get("align_output", False),
-        "diarization"              : job_input.get("diarization", False),
+        "align_output"             : job_input.get("align_output", True),
         "huggingface_access_token" : job_input.get("huggingface_access_token") or hf_token,
-        "min_speakers"             : job_input.get("min_speakers"),
-        "max_speakers"             : job_input.get("max_speakers"),
         "debug"                    : job_input.get("debug", False),
-        "diarization_turns"        : diarization_turns,
     }
 
     try:
@@ -191,62 +170,11 @@ def run(job):
         "segments"         : result.segments,
         "detected_language": result.detected_language
     }
-    # ------------------------------------------------embedding-info----------------
-    # 4) speaker verification (optional)
-    # Threshold controls how close the ECAPA cosine similarity must be before
-    # a diarized SPEAKER_XX label is auto-replaced with an enrolled name.
-    # 0.1 (old default) was effectively "always match", 0.85 is the recurring-
-    # host threshold from the pipeline plan. tenant-backend sets it via the
-    # speaker_match_threshold job input; this stays configurable from outside.
-    speaker_match_threshold = float(job_input.get("speaker_match_threshold", 0.85))
-    if embeddings:
-        try:
-            segments_with_speakers = identify_speakers_on_segments(
-                segments=output_dict["segments"],
-                audio_path=audio_file_path,
-                enrolled=embeddings,
-                threshold=speaker_match_threshold,
-            )
-            # Profile-anchored per-segment re-attribution.
-            # The previous code collapsed the per-segment matches back onto the
-            # pyannote cluster label via `relabel_speakers_by_avg_similarity`.
-            # That failed hard on remote/phone recordings where pyannote merges
-            # short alternating turns from two similar voices into one cluster —
-            # then a whole opening block like "Schönen guten Morgen, Richard. /
-            # Guten Morgen, Markus." was attributed to Markus because his name
-            # averaged higher across the cluster.
-            # Instead: trust the per-segment match when the ECAPA cosine clears
-            # `speaker_match_threshold`; keep the raw SPEAKER_XX label only on
-            # low-confidence segments so the PHP side can still merge them into
-            # a cluster for the LLM name-mapping pass.
-            flipped = 0
-            for seg in segments_with_speakers:
-                sid = seg.get("speaker_id")
-                sim = seg.get("similarity", 0.0) or 0.0
-                if sid and sid != "Unknown" and sim >= speaker_match_threshold:
-                    if sid != seg.get("speaker"):
-                        flipped += 1
-                    seg["speaker"] = sid
-                # else: keep the raw pyannote SPEAKER_XX for this segment
-            output_dict["segments"] = segments_with_speakers
-            logger.info(
-                "Speaker identification completed successfully (threshold=%s, reassigned=%d).",
-                speaker_match_threshold, flipped,
-            )
-        except Exception as e:
-            logger.error("Speaker identification failed", exc_info=True)
-            output_dict["warning"] = f"Speaker identification skipped: {e}"
-    else:
-        logger.info("No enrolled embeddings available; skipping speaker identification.")
 
     # 5) Strip segments to essential fields, then gzip+base64 compress
-    #    to stay within RunPod's payload limit. Segments arrive already
-    #    grouped by speaker turn — assign_speakers_from_turns does the
-    #    re-segmentation — so we do NOT merge adjacent same-speaker
-    #    segments here. The old merge produced the "Richard, wo erreiche
-    #    ich dich?" regression by concatenating a mis-labelled utterance
-    #    into the preceding speaker's block and making the error
-    #    unrecoverable downstream.
+    #    to stay within RunPod's payload limit. Segments here have NO
+    #    speaker labels — the caller assigns speakers post-ASR using
+    #    the diarization service output.
     import gzip as _gzip
     import json as _json
 
@@ -287,21 +215,20 @@ def run(job):
             "end": round(float(seg.get("end", 0) or 0), 3),
             "text": seg.get("text", "").strip(),
         }
-        if seg.get("speaker"):
-            clean["speaker"] = seg["speaker"]
         conf = _confidence_from_words(words)
         if conf is not None:
             clean["confidence"] = conf
         if keep_words and words:
-            clean["words"] = [
-                {
+            clean["words"] = []
+            for w in words:
+                score = w.get("score", w.get("probability"))
+                clean["words"].append({
                     "start": w.get("start"),
                     "end": w.get("end"),
                     "word": w.get("word", ""),
-                    "score": w.get("score", w.get("probability")),
-                }
-                for w in words
-            ]
+                    "score": score,
+                    "confidence": score,
+                })
         if clean["text"]:
             merged.append(clean)
 
